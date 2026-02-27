@@ -23,7 +23,7 @@ export const questaoRouter = router({
       })
     )
     .query(async ({ ctx, input }) => {
-      const userId = ctx.session.user.id as string;
+      const userId = ctx.session!.user!.id as string;
 
       // Verificar limite diário do plano
       const user = await ctx.db.user.findUnique({
@@ -56,7 +56,7 @@ export const questaoRouter = router({
           },
           skip:    (input.page - 1) * input.limit,
           take:    input.limit,
-          orderBy: { createdAt: "desc" },
+          orderBy: { id: "desc" },
         }),
         ctx.db.questao.count({
           where: {
@@ -85,7 +85,7 @@ export const questaoRouter = router({
       })
     )
     .mutation(async ({ ctx, input }) => {
-      const userId = ctx.session.user.id as string;
+      const userId = ctx.session!.user!.id as string;
 
       const questao = await ctx.db.questao.findUnique({
         where:  { id: input.questaoId },

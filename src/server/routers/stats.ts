@@ -11,7 +11,7 @@ export const statsRouter = router({
   // ── OVERVIEW — dados do dashboard principal ──────────────
   getOverview: editalProcedure
     .query(async ({ ctx }) => {
-      const userId      = ctx.session.user.id as string;
+      const userId      = ctx.session!.user!.id as string;
       const editalId    = ctx.activeEditalId;
       const seteAnosAtras = new Date();
       seteAnosAtras.setDate(seteAnosAtras.getDate() - 7);
@@ -69,7 +69,7 @@ export const statsRouter = router({
   getByDisciplina: editalProcedure
     .input(z.object({ disciplinaId: z.string() }))
     .query(async ({ ctx, input }) => {
-      const userId = ctx.session.user.id as string;
+      const userId = ctx.session!.user!.id as string;
 
       const p = await ctx.db.progressoDisciplina.findUnique({
         where: { userId_disciplinaId: { userId, disciplinaId: input.disciplinaId } },

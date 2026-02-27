@@ -20,7 +20,8 @@ export const conteudoRouter = router({
       return ctx.db.conteudo.findMany({
         where: {
           disciplinaId: input.disciplinaId,
-          tipo: input.tipo as Parameters<typeof ctx.db.conteudo.findMany>[0]["where"] extends { tipo?: infer T } ? T : never | undefined,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ...(input.tipo ? { tipo: input.tipo as any } : {}),
         },
         select: {
           id: true, tipo: true, titulo: true, descricao: true,

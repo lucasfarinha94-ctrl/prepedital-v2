@@ -23,7 +23,7 @@ import {
   Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useEditalStore } from "@/stores/edital-store";
+import { useEditalStore, selectHasEdital } from "@/stores/edital-store";
 import { usePlanStore } from "@/stores/plan-store";
 import { hasFeature } from "@/lib/feature-gating";
 import { useState } from "react";
@@ -60,7 +60,7 @@ const NAV_ITEMS: NavItem[] = [
 
 export function Sidebar() {
   const pathname    = usePathname();
-  const { hasEdital } = useEditalStore();
+  const hasEdital = useEditalStore(selectHasEdital);
   const { plan }    = usePlanStore();
   const [collapsed, setCollapsed] = useState(false);
 

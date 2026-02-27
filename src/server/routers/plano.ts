@@ -11,7 +11,7 @@ export const planoRouter = router({
   // ── PLANO ATIVO ──────────────────────────────────────────
   getActive: editalProcedure
     .query(async ({ ctx }) => {
-      const userId = ctx.session.user.id as string;
+      const userId = ctx.session!.user!.id as string;
       return ctx.db.planoEstudo.findFirst({
         where:   { userId, ativo: true },
         include: { dias: { take: 7, orderBy: { data: "asc" } } },
@@ -21,7 +21,7 @@ export const planoRouter = router({
   // ── FOCO DO DIA ──────────────────────────────────────────
   getDiaAtual: editalProcedure
     .query(async ({ ctx }) => {
-      const userId = ctx.session.user.id as string;
+      const userId = ctx.session!.user!.id as string;
 
       const hoje = new Date();
       hoje.setHours(0, 0, 0, 0);
