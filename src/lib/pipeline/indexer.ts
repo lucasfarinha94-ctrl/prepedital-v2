@@ -1,216 +1,249 @@
 // ============================================================
-// INDEXER — Indexação do banco offline proprietário
+// INDEXER — Banco offline proprietário (multi-pasta, multi-nível)
 //
-// Processa a estrutura de pastas do banco local:
-// ÁREA FISCAL/GRAN CONCURSOS/[DISCIPLINA]/[arquivos]
-// → Extrai texto → Gera embedding → Salva no Postgres
+// Estratégia:
+//   1. Varre recursivamente cada pasta-base
+//   2. Para cada PDF encontrado, sobe a árvore de pastas
+//      procurando o nome de disciplina mais próximo
+//   3. Gera embedding via Voyage AI e persiste no Postgres
 //
 // Executar: tsx scripts/index-bank.ts
 // ============================================================
 
-import { db }         from "@/lib/db";
-import { embedText }  from "@/lib/ai/embeddings";
-import pdfParse       from "pdf-parse";
-import { readdir, readFile, stat } from "fs/promises";
+import { db }        from "@/lib/db";
+import { embedText } from "@/lib/ai/embeddings";
+import pdfParse      from "pdf-parse";
+import { readdir, readFile } from "fs/promises";
 import path from "path";
 
 // ────────────────────────────────────────────────────────────
 // TIPOS
 // ────────────────────────────────────────────────────────────
 
-interface IndexOptions {
-  baseDir:     string;   // Caminho para a pasta raiz do banco
-  dryRun?:     boolean;  // Se true, não persiste no DB
-  disciplinaFilter?: string; // Processar apenas uma disciplina
+export interface IndexOptions {
+  baseDirs:          string[];  // Uma ou mais pastas-raiz para varrer
+  dryRun?:           boolean;
+  disciplinaFilter?: string;    // Filtro opcional por nome
+  maxPdfs?:          number;    // Limite (útil para testes)
 }
 
-interface IndexStats {
-  total:      number;
-  indexed:    number;
-  skipped:    number;
-  errors:     number;
-  timeMs:     number;
+export interface IndexStats {
+  total:   number;
+  indexed: number;
+  skipped: number;
+  errors:  number;
+  timeMs:  number;
 }
 
 // ────────────────────────────────────────────────────────────
-// MAPEAMENTO: pasta → disciplina slug
-// Ajuste conforme estrutura real do banco offline
+// MAPEAMENTO: qualquer parte do caminho → slug de disciplina
+// Palavras-chave detectadas em qualquer pasta do caminho
 // ────────────────────────────────────────────────────────────
 
-const PASTA_PARA_SLUG: Record<string, string> = {
-  "DIREITO ADMINISTRATIVO":  "direito-administrativo",
-  "DIREITO CONSTITUCIONAL":  "direito-constitucional",
-  "DIREITO TRIBUTÁRIO":      "direito-tributario",
-  "CONTABILIDADE GERAL":     "contabilidade-geral",
-  "CONTABILIDADE PUBLICA":   "contabilidade-publica",
-  "RACIOCÍNIO LÓGICO":       "raciocinio-logico",
-  "MATEMÁTICA FINANCEIRA":   "matematica-financeira",
-  "ESTATÍSTICA":             "estatistica",
-  "AUDITORIA":               "auditoria",
-  "LEGISLAÇÃO TRIBUTÁRIA":   "legislacao-tributaria",
-};
+const KEYWORD_SLUG: Array<{ keywords: string[]; slug: string; nome: string }> = [
+  // Direito Administrativo
+  { keywords: ["DIREITO ADMINISTRATIVO", "DIR ADMIN", "D. ADMINISTRATIVO"], slug: "direito-administrativo", nome: "Direito Administrativo" },
+  // Direito Constitucional
+  { keywords: ["DIREITO CONSTITUCIONAL", "DIR CONST", "D. CONSTITUCIONAL"], slug: "direito-constitucional", nome: "Direito Constitucional" },
+  // Direito Tributário
+  { keywords: ["DIREITO TRIBUTÁRIO", "DIREITO TRIBUTARIO", "DIR TRIB", "REFORMA TRIBUTÁRIA", "REFORMA TRIBUTARIA", "TRIBUTÁRIO", "TRIBUTARIO", "CBS", "IBS"], slug: "direito-tributario", nome: "Direito Tributário" },
+  // Direito Previdenciário
+  { keywords: ["DIREITO PREVIDENCIÁRIO", "DIREITO PREVIDENCIARIO", "PREVIDÊNCIA", "PREVIDENCIA"], slug: "direito-previdenciario", nome: "Direito Previdenciário" },
+  // Direito Civil
+  { keywords: ["DIREITO CIVIL"],                                    slug: "direito-civil",              nome: "Direito Civil" },
+  // Direito Penal
+  { keywords: ["DIREITO PENAL"],                                    slug: "direito-penal",              nome: "Direito Penal" },
+  // Contabilidade Pública (antes de geral para não ser sobrescrita)
+  { keywords: ["CONTABILIDADE PUBLICA", "CONTABILIDADE PÚBLICA", "CONTAB PUBL"], slug: "contabilidade-publica", nome: "Contabilidade Pública" },
+  // Contabilidade Geral
+  { keywords: ["CONTABILIDADE GERAL", "CONTABILIDADE INTRODUT", "CONTAB GERAL", "CONTABILIDADE ESQUEMATIZADA", "CONTABILIDADE PROF"], slug: "contabilidade-geral", nome: "Contabilidade Geral" },
+  { keywords: ["CONTABILIDADE", "CONTAB"],                          slug: "contabilidade-geral",        nome: "Contabilidade Geral" },
+  // Auditoria
+  { keywords: ["AUDITORIA"],                                        slug: "auditoria",                  nome: "Auditoria" },
+  // Raciocínio Lógico
+  { keywords: ["RACIOCÍNIO LÓGICO", "RACIOCINIO LOGICO", "RACIOC", "LÓGICO", "LOGICO"], slug: "raciocinio-logico", nome: "Raciocínio Lógico" },
+  // Matemática Financeira
+  { keywords: ["MATEMÁTICA FINANCEIRA", "MATEMATICA FINANCEIRA", "MAT FINANCEIRA"], slug: "matematica-financeira", nome: "Matemática Financeira" },
+  // Estatística
+  { keywords: ["ESTATÍSTICA", "ESTATISTICA"],                       slug: "estatistica",                nome: "Estatística" },
+  // Economia e Finanças Públicas
+  { keywords: ["ECONOMIA", "FINANÇAS PÚBLICAS", "FINANCAS PUBLICAS", "AFO", "FIN PUBL", "FINANCAS PUBL"], slug: "economia-financas", nome: "Economia e Finanças Públicas" },
+  // Legislação Tributária
+  { keywords: ["LEGISLAÇÃO TRIBUTÁRIA", "LEGISLACAO TRIBUTARIA", "LEGISL TRIBUTARIA", "LTE", "LEIS SEFA", "LEGISLAÇÃO"], slug: "legislacao-tributaria", nome: "Legislação Tributária" },
+  // Tecnologia da Informação
+  { keywords: ["TECNOLOGIA DA INFORMAÇÃO", "TECNOLOGIA DA INFORMACAO", "TI TOTAL", "TI_TOTAL", "INFORMATICA", "TECNOLOGIA", "FLUÊNCIA EM DADOS", "FLUENCIA EM DADOS"], slug: "tecnologia-informacao", nome: "Tecnologia da Informação" },
+  // Administração Pública
+  { keywords: ["ADMINISTRACAO PUBLICA", "ADMINISTRAÇÃO PÚBLICA", "ADMIN PUBLICA", "ADMIN PÚBLICA"], slug: "administracao-publica", nome: "Administração Pública" },
+  // Administração Geral
+  { keywords: ["ADMINISTRACAO GERAL", "ADMINISTRAÇÃO GERAL", "ADMIN GERAL"], slug: "administracao-geral", nome: "Administração Geral" },
+  // Português
+  { keywords: ["PORTUGUÊS", "PORTUGUES", "LÍNGUA PORTUGUESA", "LINGUA PORTUGUESA"], slug: "portugues", nome: "Português" },
+  // Inglês
+  { keywords: ["INGLÊS", "INGLES"],                                 slug: "ingles",                     nome: "Inglês" },
+  // Inteligência Emocional
+  { keywords: ["INTELIGENCIA EMOCIONAL", "INTELIGÊNCIA EMOCIONAL"], slug: "inteligencia-emocional",    nome: "Inteligência Emocional" },
+  // Discursivas / Redação
+  { keywords: ["DISCURSIVAS", "DISCURSIVA", "REDAÇÃO", "REDACAO"], slug: "redacao-discursivas",        nome: "Redação e Discursivas" },
+  // Questões gerais / provas anteriores
+  { keywords: ["QUEBRANDO", "QUESTOES INEDITAS", "QUESTÕES INÉDITAS", "PROVAS ANTERIORES", "SIMULADO"], slug: "questoes-gerais", nome: "Questões Gerais" },
+];
 
 // ────────────────────────────────────────────────────────────
-// FUNÇÃO PRINCIPAL DE INDEXAÇÃO
+// DETECTAR DISCIPLINA A PARTIR DO CAMINHO DO ARQUIVO
+// ────────────────────────────────────────────────────────────
+
+function detectarDisciplina(filePath: string): { slug: string; nome: string } | null {
+  // normalize("NFC") resolve diferença macOS HFS+ (NFD) vs strings TS (NFC)
+  const partes = filePath.normalize("NFC").toUpperCase().split(path.sep);
+
+  // Tenta do mais específico (pasta imediata) para o mais geral
+  for (let i = partes.length - 1; i >= 0; i--) {
+    const parte = partes[i];
+    for (const entry of KEYWORD_SLUG) {
+      if (entry.keywords.some((kw) => parte.includes(kw))) {
+        return { slug: entry.slug, nome: entry.nome };
+      }
+    }
+  }
+  return null;
+}
+
+// ────────────────────────────────────────────────────────────
+// FUNÇÃO PRINCIPAL
 // ────────────────────────────────────────────────────────────
 
 export async function indexBank(opts: IndexOptions): Promise<IndexStats> {
   const startTime = Date.now();
   const stats: IndexStats = { total: 0, indexed: 0, skipped: 0, errors: 0, timeMs: 0 };
 
-  console.log(`[Indexer] Iniciando indexação: ${opts.baseDir}`);
+  // Cache de disciplinas para evitar queries repetidas
+  const disciplinaCache = new Map<string, string>(); // slug → id
 
-  // Listar pastas de disciplinas
-  const entries = await readdir(opts.baseDir, { withFileTypes: true });
-  const disciplinaPastas = entries.filter((e) => e.isDirectory());
+  for (const baseDir of opts.baseDirs) {
+    console.log(`\n[Indexer] Varrendo: ${baseDir}`);
+    const pdfs = await coletarPdfs(baseDir, opts.maxPdfs);
+    console.log(`[Indexer] Encontrados ${pdfs.length} PDFs`);
 
-  for (const pastaEntry of disciplinaPastas) {
-    const nomePasta = pastaEntry.name.toUpperCase();
+    for (const pdfPath of pdfs) {
+      if (opts.maxPdfs && stats.total >= opts.maxPdfs) break;
+      stats.total++;
 
-    // Filtro opcional
-    if (opts.disciplinaFilter &&
-        !nomePasta.includes(opts.disciplinaFilter.toUpperCase())) {
-      continue;
+      // Detectar disciplina pelo caminho
+      const disciplinaInfo = detectarDisciplina(pdfPath);
+      if (!disciplinaInfo) {
+        stats.skipped++;
+        process.stdout.write("s");
+        continue;
+      }
+
+      // Filtro opcional
+      if (opts.disciplinaFilter &&
+          !disciplinaInfo.nome.toUpperCase().includes(opts.disciplinaFilter.toUpperCase())) {
+        stats.skipped++;
+        continue;
+      }
+
+      // Buscar ou criar disciplina
+      let disciplinaId = disciplinaCache.get(disciplinaInfo.slug);
+      if (!disciplinaId) {
+        const disc = await db.disciplina.upsert({
+          where:  { slug: disciplinaInfo.slug },
+          create: {
+            nome: disciplinaInfo.nome,
+            slug: disciplinaInfo.slug,
+            area: inferirArea(disciplinaInfo.slug),
+            cor:  gerarCor(disciplinaInfo.slug),
+          },
+          update: {},
+        });
+        disciplinaId = disc.id;
+        disciplinaCache.set(disciplinaInfo.slug, disciplinaId);
+      }
+
+      // Indexar o PDF
+      await indexarPdf({ pdfPath, disciplinaId, dryRun: opts.dryRun ?? false, stats });
     }
-
-    const slug = PASTA_PARA_SLUG[nomePasta];
-    if (!slug) {
-      console.warn(`[Indexer] Pasta sem mapeamento: ${nomePasta} — ignorando`);
-      stats.skipped++;
-      continue;
-    }
-
-    // Buscar ou criar disciplina no DB
-    const disciplina = await db.disciplina.upsert({
-      where:  { slug },
-      create: {
-        nome: nomePasta
-          .split(" ")
-          .map((w) => w.charAt(0) + w.slice(1).toLowerCase())
-          .join(" "),
-        slug,
-        area: inferirArea(slug),
-        cor:  gerarCor(slug),
-      },
-      update: {},
-    });
-
-    const disciplinaDir = path.join(opts.baseDir, pastaEntry.name);
-    console.log(`[Indexer] Processando: ${disciplina.nome}`);
-
-    // Indexar arquivos da disciplina recursivamente
-    await indexarDiretorio({
-      dir:           disciplinaDir,
-      disciplinaId:  disciplina.id,
-      dryRun:        opts.dryRun ?? false,
-      stats,
-    });
   }
 
   stats.timeMs = Date.now() - startTime;
-  console.log(
-    `[Indexer] Concluído: ${stats.indexed} indexados, ` +
-    `${stats.skipped} ignorados, ${stats.errors} erros ` +
-    `em ${(stats.timeMs / 1000).toFixed(1)}s`
-  );
-
   return stats;
 }
 
 // ────────────────────────────────────────────────────────────
-// INDEXAR DIRETÓRIO RECURSIVAMENTE
+// COLETAR TODOS OS PDFs RECURSIVAMENTE
 // ────────────────────────────────────────────────────────────
 
-async function indexarDiretorio(opts: {
-  dir:          string;
-  disciplinaId: string;
-  topicoId?:    string;
-  dryRun:       boolean;
-  stats:        IndexStats;
-}) {
-  const { dir, disciplinaId, topicoId, dryRun, stats } = opts;
-  let entries: Awaited<ReturnType<typeof readdir>>;
+async function coletarPdfs(dir: string, limite?: number): Promise<string[]> {
+  const resultado: string[] = [];
 
-  try {
-    entries = await readdir(dir, { withFileTypes: true });
-  } catch {
-    stats.errors++;
-    return;
-  }
+  async function varrer(current: string) {
+    if (limite && resultado.length >= limite) return;
 
-  for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-
-    if (entry.isDirectory()) {
-      // Sub-pasta = tópico
-      const topico = await criarOuBuscarTopico({
-        nome:        entry.name,
-        disciplinaId,
-        parentId:    topicoId,
-      });
-
-      await indexarDiretorio({
-        dir:          fullPath,
-        disciplinaId,
-        topicoId:     topico.id,
-        dryRun,
-        stats,
-      });
-      continue;
+    let entries;
+    try {
+      entries = await readdir(current, { withFileTypes: true });
+    } catch {
+      return;
     }
 
-    // Processar arquivo
-    stats.total++;
-    const ext = path.extname(entry.name).toLowerCase();
+    for (const entry of entries) {
+      if (limite && resultado.length >= limite) break;
 
-    if (ext === ".pdf") {
-      await indexarPdf({
-        filePath:     fullPath,
-        fileName:     entry.name,
-        disciplinaId,
-        topicoId,
-        dryRun,
-        stats,
-      });
-    } else {
-      stats.skipped++;
+      const fullPath = path.join(current, entry.name);
+
+      if (entry.isDirectory()) {
+        // Ignorar pastas inúteis
+        if (entry.name.startsWith(".") || entry.name.endsWith(".zip")) continue;
+        await varrer(fullPath);
+      } else if (entry.name.toLowerCase().endsWith(".pdf")) {
+        resultado.push(fullPath);
+      }
     }
   }
+
+  await varrer(dir);
+  return resultado;
 }
 
 // ────────────────────────────────────────────────────────────
-// INDEXAR PDF
+// INDEXAR UM PDF
 // ────────────────────────────────────────────────────────────
 
 async function indexarPdf(opts: {
-  filePath:     string;
-  fileName:     string;
+  pdfPath:      string;
   disciplinaId: string;
-  topicoId?:    string;
   dryRun:       boolean;
   stats:        IndexStats;
 }) {
-  const { filePath, fileName, disciplinaId, topicoId, dryRun, stats } = opts;
+  const { pdfPath, disciplinaId, dryRun, stats } = opts;
+  const fileName = path.basename(pdfPath);
 
   try {
-    // Verificar se já foi indexado (por nome de arquivo)
+    // Verificar se já foi indexado
     const existente = await db.conteudo.findFirst({
-      where: { storageKey: filePath },
+      where:  { storageKey: pdfPath },
       select: { id: true },
     });
-
     if (existente) {
       stats.skipped++;
       return;
     }
 
     // Extrair texto do PDF
-    const buffer  = await readFile(filePath);
+    const buffer  = await readFile(pdfPath);
     const pdfData = await pdfParse(buffer);
-    const texto   = pdfData.text.slice(0, 10000); // Primeiros 10k chars
+    const texto   = pdfData.text?.trim();
 
-    if (!texto.trim()) {
+    if (!texto || texto.length < 50) {
       stats.skipped++;
+      process.stdout.write("_");
+      return;
+    }
+
+    // Em dry-run pula a API de embeddings (sem custo)
+    if (dryRun) {
+      stats.indexed++;
+      process.stdout.write(".");
       return;
     }
 
@@ -218,20 +251,19 @@ async function indexarPdf(opts: {
     const embedding = await embedText(texto.slice(0, 8000));
 
     if (!dryRun) {
-      // Criar conteúdo no DB com embedding
       await db.$executeRaw`
-        INSERT INTO conteudos (
-          id, disciplina_id, topico_id, tipo, titulo,
-          corpo, storage_key, embedding, created_at
+        INSERT INTO "Conteudo" (
+          id, disciplina_id, tipo, titulo,
+          corpo, storage_key, embedding, created_at, updated_at
         ) VALUES (
           gen_random_uuid(),
-          ${disciplinaId},
-          ${topicoId ?? null},
+          ${disciplinaId}::text,
           'RESUMO',
-          ${fileName.replace(/\.[^.]+$/, "")},
-          ${texto.slice(0, 2000)},
-          ${filePath},
+          ${fileName.replace(/\.pdf$/i, "")},
+          ${texto.slice(0, 3000)},
+          ${pdfPath},
           ${embedding}::vector,
+          NOW(),
           NOW()
         )
         ON CONFLICT (storage_key) DO NOTHING;
@@ -251,56 +283,22 @@ async function indexarPdf(opts: {
 // HELPERS
 // ────────────────────────────────────────────────────────────
 
-async function criarOuBuscarTopico(opts: {
-  nome:         string;
-  disciplinaId: string;
-  parentId?:    string;
-}): Promise<{ id: string }> {
-  const slug = opts.nome
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9\s-]/g, "")
-    .replace(/\s+/g, "-")
-    .slice(0, 60);
-
-  return db.topico.upsert({
-    where: {
-      // Usar findFirst já que não há unique composta
-      id: (
-        await db.topico.findFirst({
-          where: { disciplinaId: opts.disciplinaId, slug },
-          select: { id: true },
-        })
-      )?.id ?? "new",
-    },
-    create: {
-      nome:        opts.nome,
-      slug,
-      disciplinaId: opts.disciplinaId,
-      parentId:    opts.parentId ?? null,
-      nivel:       opts.parentId ? 2 : 1,
-    },
-    update: {},
-  });
-}
-
 function inferirArea(slug: string): string {
-  if (slug.includes("direito"))   return "juridica";
-  if (slug.includes("contabil"))  return "contabil";
-  if (slug.includes("ti") || slug.includes("informatica")) return "ti";
-  if (slug.includes("fiscal") || slug.includes("tributar")) return "fiscal";
+  if (slug.includes("direito"))    return "juridica";
+  if (slug.includes("contabil"))   return "contabil";
+  if (slug.includes("tecnologia") || slug.includes("ti")) return "ti";
+  if (slug.includes("fiscal") || slug.includes("tributar") || slug.includes("legisla")) return "fiscal";
+  if (slug.includes("economia"))   return "fiscal";
   return "geral";
 }
 
 function gerarCor(slug: string): string {
-  // Mapeamento fixo de cores por área
   const cores: Record<string, string> = {
-    juridica:  "#5B8CFF",
-    contabil:  "#22C55E",
-    ti:        "#F59E0B",
-    fiscal:    "#EF4444",
-    geral:     "#94A3B8",
+    juridica: "#5B8CFF",
+    contabil: "#22C55E",
+    ti:       "#F59E0B",
+    fiscal:   "#EF4444",
+    geral:    "#94A3B8",
   };
   return cores[inferirArea(slug)] ?? "#64748B";
 }
