@@ -232,7 +232,34 @@ async function indexarPdf(opts: {
     // Extrair texto do PDF
     const buffer  = await readFile(pdfPath);
     const pdfData = await pdfParse(buffer);
-    const texto   = pdfData.text?.trim();
+    const textoRaw = pdfData.text?.trim();
+
+    if (!textoRaw || textoRaw.length < 50) {
+      stats.skipped++;
+      process.stdout.write("_");
+      return;
+    }
+
+    // Pular capa/copyright (primeiras linhas curtas = metadados)
+    // Encontra onde começa o conteúdo real: primeira linha longa (>80 chars)
+    const linhas = textoRaw.split("\n");
+    let inicioConteudo = 0;
+    let charsAcumulados = 0;
+    for (let i = 0; i < linhas.length; i++) {
+      const linha = linhas[i].trim();
+      // Pula linhas curtas, datas, códigos, nomes de autores, copyright
+      if (
+        charsAcumulados < 2000 &&
+        (linha.length < 60 ||
+          /^(presidente|vice|diretor|coordenador|código|o conteúdo|www\.|todo o material|será proibid|isbn|©|copyright|gran cursos|professor|autora?:)/i.test(linha))
+      ) {
+        charsAcumulados += linha.length + 1;
+        inicioConteudo = i + 1;
+        continue;
+      }
+      break;
+    }
+    const texto = linhas.slice(inicioConteudo).join("\n").trim() || textoRaw;
 
     if (!texto || texto.length < 50) {
       stats.skipped++;
@@ -247,26 +274,24 @@ async function indexarPdf(opts: {
       return;
     }
 
-    // Gerar embedding
-    const embedding = await embedText(texto.slice(0, 8000));
+    // Gerar embedding (usa texto completo para melhor semântica)
+    const embedding = await embedText(textoRaw.slice(0, 8000));
 
     if (!dryRun) {
       await db.$executeRaw`
-        INSERT INTO "Conteudo" (
-          id, disciplina_id, tipo, titulo,
-          corpo, storage_key, embedding, created_at, updated_at
+        INSERT INTO "conteudos" (
+          id, "disciplinaId", tipo, titulo,
+          corpo, "storageKey", embedding, "createdAt"
         ) VALUES (
           gen_random_uuid(),
           ${disciplinaId}::text,
-          'RESUMO',
+          'RESUMO'::"ConteudoTipo",
           ${fileName.replace(/\.pdf$/i, "")},
           ${texto.slice(0, 3000)},
           ${pdfPath},
           ${embedding}::vector,
-          NOW(),
           NOW()
-        )
-        ON CONFLICT (storage_key) DO NOTHING;
+        );
       `;
     }
 
