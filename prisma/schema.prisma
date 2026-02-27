@@ -1,0 +1,578 @@
+// ============================================================
+// SCHEMA PRISMA — Sistema Inteligente de Preparação V2
+// PostgreSQL + pgvector extension
+// ============================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgvector(map: "vector")]
+}
+
+// ────────────────────────────────────────────────────────────
+// ENUMS
+// ────────────────────────────────────────────────────────────
+
+enum UserRole {
+  USER
+  ADMIN
+  FOUNDER
+}
+
+enum PlanTier {
+  FREE
+  PRO
+  ELITE
+  FOUNDER
+}
+
+enum EditalStatus {
+  UPLOADING    // PDF sendo enviado para storage
+  QUEUED       // Na fila de processamento
+  PARSING      // Claude extraindo metadados
+  MAPPING      // Cruzando com banco offline
+  PLANNING     // Gerando plano de estudos IA
+  ACTIVE       // Pronto para uso
+  ARCHIVED     // Desativado pelo usuário
+  ERROR        // Falhou no processamento
+}
+
+enum ConteudoTipo {
+  RESUMO
+  AULA_VIDEO
+  MAPA_MENTAL
+  QUESTOES_COMENTADAS
+  LEGISLACAO
+  JURISPRUDENCIA
+}
+
+enum QuestaoTipo {
+  MULTIPLA_ESCOLHA
+  CERTO_ERRADO
+  DISCURSIVA
+}
+
+enum QuestaoDificuldade {
+  FACIL
+  MEDIO
+  DIFICIL
+}
+
+enum SessaoTipo {
+  ESTUDO
+  QUESTOES
+  SIMULADO
+  REVISAO
+  LEITURA
+}
+
+enum SimuladoTipo {
+  EDITAL_COMPLETO
+  DISCIPLINA
+  PONTOS_FRACOS
+  ALEATORIO
+  CRONOMETRADO
+}
+
+enum SimuladoStatus {
+  PENDENTE
+  EM_ANDAMENTO
+  CONCLUIDO
+  ABANDONADO
+}
+
+enum JobStatus {
+  QUEUED
+  PROCESSING
+  DONE
+  FAILED
+}
+
+// ────────────────────────────────────────────────────────────
+// AUTH — NextAuth v5 compatibility
+// ────────────────────────────────────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  password      String?   // bcrypt hash (credenciais locais)
+
+  role     UserRole @default(USER)
+  plan     PlanTier @default(FREE)
+  planExp  DateTime? // null = vitalício ou não assinante
+
+  // Relações Auth
+  accounts Account[]
+  sessions Session[]
+
+  // Relações de negócio
+  editais       Edital[]
+  planosEstudo  PlanoEstudo[]
+  sessoesEstudo SessaoEstudo[]
+  respostas     Resposta[]
+  simulados     Simulado[]
+  progresso     ProgressoDisciplina[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ────────────────────────────────────────────────────────────
+// EDITAL — núcleo do sistema
+// ────────────────────────────────────────────────────────────
+
+model Edital {
+  id     String @id @default(cuid())
+  userId String
+
+  // Metadados do arquivo
+  nomeArquivo  String
+  storageKey   String  // Supabase Storage key
+  tamanhoBytes Int
+  hashMd5      String  // deduplicação
+
+  // Metadados extraídos por IA (Claude)
+  banca         String?
+  orgao         String?
+  cargo         String?
+  editalNumero  String?
+  dataPublicacao DateTime?
+  dataProva      DateTime?
+  localProva     String?
+  totalQuestoes  Int?
+  salario        Decimal?  @db.Decimal(10, 2)
+  vagas          Int?
+
+  // Conteúdo raw extraído
+  textoRaw      String?   @db.Text
+  metadadosJson Json?     // snapshot completo do Claude
+
+  // Status de processamento
+  status       EditalStatus @default(UPLOADING)
+  errorMessage String?      @db.Text
+  jobId        String?      // ID do job na fila
+
+  // Plano gerado
+  planoEstudo PlanoEstudo?
+
+  // Disciplinas mapeadas deste edital
+  disciplinas EditalDisciplina[]
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, status])
+  @@index([hashMd5])
+  @@map("editais")
+}
+
+// Disciplinas extraídas de um edital específico
+model EditalDisciplina {
+  id       String @id @default(cuid())
+  editalId String
+
+  nome         String
+  peso         Float   // % de questões no edital
+  numQuestoes  Int
+  topicosJson  Json    // array de tópicos extraídos pelo Claude
+
+  // Referência ao banco offline (pode ser null se não encontrado)
+  disciplinaId String?
+  disciplina   Disciplina? @relation(fields: [disciplinaId], references: [id])
+
+  edital Edital @relation(fields: [editalId], references: [id], onDelete: Cascade)
+
+  @@index([editalId])
+  @@map("edital_disciplinas")
+}
+
+// ────────────────────────────────────────────────────────────
+// BANCO OFFLINE PROPRIETÁRIO
+// ────────────────────────────────────────────────────────────
+
+// Disciplinas mestre (banco offline)
+model Disciplina {
+  id   String @id @default(cuid())
+  nome String @unique
+  slug String @unique // ex: "direito-administrativo"
+  area String  // ex: "juridica", "contabil", "ti", "fiscal"
+  cor  String  // hex color para UI
+
+  topicos    Topico[]
+  conteudos  Conteudo[]
+  questoes   Questao[]
+  editalDisciplinas EditalDisciplina[]
+  progresso  ProgressoDisciplina[]
+
+  @@map("disciplinas")
+}
+
+// Hierarquia: Disciplina → Tópico → Subtópico
+model Topico {
+  id           String  @id @default(cuid())
+  disciplinaId String
+  parentId     String? // null = raiz
+
+  nome     String
+  slug     String
+  ordem    Int     @default(0)
+  nivel    Int     @default(1) // 1=raiz, 2=sub, 3=subsub
+
+  disciplina Disciplina @relation(fields: [disciplinaId], references: [id], onDelete: Cascade)
+  parent     Topico?    @relation("TopicoHierarquia", fields: [parentId], references: [id])
+  filhos     Topico[]   @relation("TopicoHierarquia")
+  conteudos  Conteudo[]
+  questoes   Questao[]
+
+  @@index([disciplinaId, parentId])
+  @@map("topicos")
+}
+
+// Materiais de estudo indexados
+model Conteudo {
+  id           String @id @default(cuid())
+  disciplinaId String
+  topicoId     String?
+
+  tipo         ConteudoTipo
+  titulo       String
+  descricao    String?       @db.Text
+  corpo        String?       @db.Text // texto extraído/resumo
+  storageKey   String?       // arquivo no Supabase Storage
+  url          String?       // URL externa se aplicável
+  duracao      Int?          // em minutos (para vídeos)
+  fonte        String?       // "Gran Concursos", "Estrategia", etc.
+  anoReferencia Int?
+
+  // Vetor semântico (1536-dim OpenAI text-embedding-3-small)
+  embedding Unsupported("vector(1536)")?
+
+  disciplina Disciplina @relation(fields: [disciplinaId], references: [id])
+  topico     Topico?    @relation(fields: [topicoId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([disciplinaId, tipo])
+  @@index([topicoId])
+  @@map("conteudos")
+}
+
+// Banco de questões
+model Questao {
+  id           String @id @default(cuid())
+  disciplinaId String
+  topicoId     String?
+
+  // Metadata da questão
+  enunciado    String   @db.Text
+  alternativas Json     // [{id:"a", texto:"...", correta: bool}]
+  gabarito     String   // "a", "b", "c", "d", "e" ou "C/E"
+  comentario   String?  @db.Text
+  tipo         QuestaoTipo         @default(MULTIPLA_ESCOLHA)
+  dificuldade  QuestaoDificuldade  @default(MEDIO)
+
+  // Origem
+  banca       String?  // "CESPE", "FCC", "VUNESP"
+  orgao       String?
+  cargo       String?
+  ano         Int?
+  codigoQstao String?  @unique // ID original da fonte
+
+  // Vetor semântico
+  embedding Unsupported("vector(1536)")?
+
+  // Stats calculados (desnormalizado para performance)
+  totalRespostas Int   @default(0)
+  totalAcertos   Int   @default(0)
+  taxaAcerto     Float @default(0.0) // 0.0-1.0
+
+  disciplina Disciplina @relation(fields: [disciplinaId], references: [id])
+  topico     Topico?    @relation(fields: [topicoId], references: [id])
+  respostas  Resposta[]
+  simuladoQuestoes SimuladoQuestao[]
+
+  @@index([disciplinaId, dificuldade])
+  @@index([banca, ano])
+  @@map("questoes")
+}
+
+// ────────────────────────────────────────────────────────────
+// PLANO DE ESTUDOS — gerado por IA
+// ────────────────────────────────────────────────────────────
+
+model PlanoEstudo {
+  id       String @id @default(cuid())
+  userId   String
+  editalId String @unique
+
+  // Parâmetros do plano
+  dataInicio   DateTime
+  dataFinal    DateTime // = dataProva do edital
+  horasDia     Float    // média de horas disponíveis por dia
+  diasSemana   Json     // [1,2,3,4,5] = seg-sex
+
+  // Distribuição calculada por IA
+  distribuicaoJson Json // {disciplinaId: {percentual, horasTotal, ciclos}}
+
+  // Meta geral
+  probabilidadeAprovacao Float @default(0.0) // 0.0-1.0
+
+  ativo Boolean @default(true)
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  edital Edital @relation(fields: [editalId], references: [id], onDelete: Cascade)
+  dias  PlanoDia[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, ativo])
+  @@map("planos_estudo")
+}
+
+// Cronograma diário do plano
+model PlanoDia {
+  id          String @id @default(cuid())
+  planoId     String
+  data        DateTime @db.Date
+
+  itensJson   Json    // [{tipo, disciplinaId, topicoId, duracaoMin, prioridade}]
+  concluido   Boolean @default(false)
+  concluidoEm DateTime?
+
+  plano PlanoEstudo @relation(fields: [planoId], references: [id], onDelete: Cascade)
+
+  @@unique([planoId, data])
+  @@index([planoId, data])
+  @@map("plano_dias")
+}
+
+// ────────────────────────────────────────────────────────────
+// PROGRESSO DO USUÁRIO
+// ────────────────────────────────────────────────────────────
+
+// Sessões de estudo
+model SessaoEstudo {
+  id     String @id @default(cuid())
+  userId String
+
+  tipo         SessaoTipo
+  disciplinaId String?
+  topicoId     String?
+  editalId     String?
+
+  iniciadaEm   DateTime @default(now())
+  encerradaEm  DateTime?
+  duracaoMin   Int?     // calculado ao encerrar
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, tipo])
+  @@index([userId, iniciadaEm])
+  @@map("sessoes_estudo")
+}
+
+// Respostas de questões
+model Resposta {
+  id       String @id @default(cuid())
+  userId   String
+  questaoId String
+
+  respostaAlternativa String  // "a", "b", "c", "d", "e"
+  correta             Boolean
+  tempoSegundos       Int?
+  simuladoId          String?
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  questao Questao @relation(fields: [questaoId], references: [id])
+
+  respondidaEm DateTime @default(now())
+
+  @@index([userId, questaoId])
+  @@index([userId, respondidaEm])
+  @@map("respostas")
+}
+
+// Progresso por disciplina (desnormalizado para performance)
+model ProgressoDisciplina {
+  id           String @id @default(cuid())
+  userId       String
+  disciplinaId String
+
+  totalQuestoes    Int   @default(0)
+  totalAcertos     Int   @default(0)
+  taxaAcerto       Float @default(0.0)
+  horasEstudadas   Float @default(0.0)
+  ultimaAtividade  DateTime?
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  disciplina Disciplina @relation(fields: [disciplinaId], references: [id])
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, disciplinaId])
+  @@map("progresso_disciplinas")
+}
+
+// ────────────────────────────────────────────────────────────
+// SIMULADOS
+// ────────────────────────────────────────────────────────────
+
+model Simulado {
+  id     String @id @default(cuid())
+  userId String
+
+  tipo          SimuladoTipo
+  titulo        String
+  duracaoMin    Int          // tempo limite
+  totalQuestoes Int
+
+  status        SimuladoStatus @default(PENDENTE)
+  iniciadoEm    DateTime?
+  encerradoEm   DateTime?
+
+  // Resultado
+  pontuacao       Float?  // 0.0-100.0
+  acertos         Int?
+  tempoGastoMin   Int?
+  resultadoJson   Json?   // breakdown por disciplina
+
+  user     User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  questoes SimuladoQuestao[]
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, status])
+  @@map("simulados")
+}
+
+model SimuladoQuestao {
+  id         String @id @default(cuid())
+  simuladoId String
+  questaoId  String
+  ordem      Int
+
+  // Resposta do usuário neste simulado
+  respostaAlternativa String?
+  correta             Boolean?
+  tempoSegundos       Int?
+
+  simulado Simulado @relation(fields: [simuladoId], references: [id], onDelete: Cascade)
+  questao  Questao  @relation(fields: [questaoId], references: [id])
+
+  @@unique([simuladoId, questaoId])
+  @@index([simuladoId])
+  @@map("simulado_questoes")
+}
+
+// ────────────────────────────────────────────────────────────
+// FEATURE GATING — configuração por plano
+// ────────────────────────────────────────────────────────────
+
+model PlanConfig {
+  id   String   @id @default(cuid())
+  plan PlanTier @unique
+
+  // Limites quantitativos
+  maxEditais         Int  // -1 = ilimitado
+  maxQuestoesDia     Int
+  maxSimuladosDia    Int
+  maxDisciplinas     Int  // do banco offline (-1 = todas)
+
+  // Feature flags
+  hasSimulados           Boolean @default(false)
+  hasRevisaoIA           Boolean @default(false)
+  hasPdfExport           Boolean @default(false)
+  hasRelatoriosAvancados Boolean @default(false)
+  hasSuportePrioritario  Boolean @default(false)
+  hasBancoCompleto       Boolean @default(false)
+  hasApiAccess           Boolean @default(false)
+  hasDebugTools          Boolean @default(false) // apenas FOUNDER
+
+  precoMensal Decimal? @db.Decimal(10, 2)
+  descricao   String?
+
+  updatedAt DateTime @updatedAt
+
+  @@map("plan_configs")
+}
+
+// ────────────────────────────────────────────────────────────
+// JOBS DE PROCESSAMENTO — rastreamento de pipeline
+// ────────────────────────────────────────────────────────────
+
+model ProcessingJob {
+  id       String @id @default(cuid())
+  editalId String
+
+  status   JobStatus @default(QUEUED)
+  etapa    String?   // "parsing", "mapping", "planning"
+  progresso Int      @default(0) // 0-100
+
+  tentativas Int @default(0)
+  maxTentativas Int @default(3)
+
+  erroMensagem String? @db.Text
+  erroStack    String? @db.Text
+
+  iniciadoEm   DateTime?
+  concluidoEm  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([editalId])
+  @@index([status])
+  @@map("processing_jobs")
+}
