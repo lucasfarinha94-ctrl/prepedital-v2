@@ -240,26 +240,61 @@ async function indexarPdf(opts: {
       return;
     }
 
-    // Pular capa/copyright (primeiras linhas curtas = metadados)
-    // Encontra onde começa o conteúdo real: primeira linha longa (>80 chars)
+    // ── 1. Limpar texto: corrigir palavras coladas (problema de fonte PDF) ──
+    function fixSpaces(t: string): string {
+      return t
+        // Espaço entre minúscula → maiúscula (ex: "vocêJá" → "você Já")
+        .replace(/([a-záàâãéèêíïóôõúüçñ])([A-ZÁÀÂÃÉÈÊÍÏÓÔÕÚÜÇÑ])/g, "$1 $2")
+        // Espaço após pontuação colada (ex: "texto.Próximo" → "texto. Próximo")
+        .replace(/([.!?;:,])([A-Za-záàâãéèêíïóôõúüçñ])/g, "$1 $2")
+        // Remove espaços duplos
+        .replace(/ {2,}/g, " ")
+        .trim();
+    }
+
+    // ── 2. Remover blocos de capa, copyright e sumário ──
     const linhas = textoRaw.split("\n");
-    let inicioConteudo = 0;
-    let charsAcumulados = 0;
-    for (let i = 0; i < linhas.length; i++) {
-      const linha = linhas[i].trim();
-      // Pula linhas curtas, datas, códigos, nomes de autores, copyright
-      if (
-        charsAcumulados < 2000 &&
-        (linha.length < 60 ||
-          /^(presidente|vice|diretor|coordenador|código|o conteúdo|www\.|todo o material|será proibid|isbn|©|copyright|gran cursos|professor|autora?:)/i.test(linha))
-      ) {
-        charsAcumulados += linha.length + 1;
-        inicioConteudo = i + 1;
+    const linhasLimpas: string[] = [];
+    let dentroSumario = false;
+    let charsCapaAcum = 0;
+    let passouCapa = false;
+
+    for (const linhaOriginal of linhas) {
+      const linha = linhaOriginal.trim();
+
+      // Detectar início de sumário / índice
+      if (/^(sum[aá]rio|[íi]ndice|conte[uú]do)\s*$/i.test(linha)) {
+        dentroSumario = true;
         continue;
       }
-      break;
+      // Sair do sumário quando aparecer linha de conteúdo real (sem pontinhos)
+      if (dentroSumario) {
+        if (/\.{3,}/.test(linha) || /^\d+$/.test(linha) || linha.length < 5) continue;
+        dentroSumario = false;
+      }
+
+      // Pular capa/metadados no início (até 2500 chars acumulados)
+      if (!passouCapa && charsCapaAcum < 2500) {
+        const ehMetadado =
+          linha.length < 60 ||
+          /^(presidente|vice|diretor|coordenador|c[oó]digo|o conte[uú]do|www\.|todo o material|ser[aá] proibid|isbn|©|copyright|gran cursos|professor|autora?:|doutor|mestre|especiali|bacharel|pela universidade|lattes\.cnpq)/i.test(linha);
+        if (ehMetadado) {
+          charsCapaAcum += linha.length + 1;
+          continue;
+        }
+        passouCapa = true;
+      }
+
+      // Pular rodapés repetitivos
+      if (/^(www\.|O conte[uú]do deste livro|CÓDIGO:|de \d{1,3} \s*www\.)/i.test(linha)) continue;
+      if (/^\d{1,3}\s+de\s+\d{1,3}/.test(linha)) continue; // "3 de 164"
+
+      linhasLimpas.push(linhaOriginal);
     }
-    const texto = linhas.slice(inicioConteudo).join("\n").trim() || textoRaw;
+
+    // ── 3. Juntar, corrigir espaços e validar ──
+    const textoBase = linhasLimpas.join("\n").trim() || textoRaw;
+    const texto = fixSpaces(textoBase);
 
     if (!texto || texto.length < 50) {
       stats.skipped++;
@@ -287,7 +322,7 @@ async function indexarPdf(opts: {
           ${disciplinaId}::text,
           'RESUMO'::"ConteudoTipo",
           ${fileName.replace(/\.pdf$/i, "")},
-          ${texto.slice(0, 3000)},
+          ${texto.slice(0, 6000)},
           ${pdfPath},
           ${embedding}::vector,
           NOW()
