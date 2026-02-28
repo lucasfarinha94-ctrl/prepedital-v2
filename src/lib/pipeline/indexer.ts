@@ -15,6 +15,54 @@ import { embedText } from "@/lib/ai/embeddings";
 import pdfParse      from "pdf-parse";
 import { readdir, readFile } from "fs/promises";
 import path from "path";
+import Anthropic from "@anthropic-ai/sdk";
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// Usa Claude Haiku para limpar o texto extraído do PDF
+// Sem limite de caracteres — armazena conteúdo completo
+async function limparTextoComClaude(textoRaw: string): Promise<string> {
+  // Haiku suporta 200k tokens de contexto; mandamos tudo
+  const msg = await anthropic.messages.create({
+    model: "claude-haiku-4-5",
+    max_tokens: 8096,
+    messages: [{
+      role: "user",
+      content: `Você é um limpador de texto de materiais didáticos brasileiros para concursos públicos.
+
+O texto abaixo foi extraído de um PDF com problemas de codificação. Limpe-o seguindo estas regras:
+1. Junte palavras separadas incorretamente (ex: "Direi To Tribu Tário" → "Direito Tributário", "Pri NCÍPio S" → "Princípios")
+2. Junte palavras coladas sem espaço (ex: "vocêJáouviu" → "você já ouviu")
+3. Remova sumários, índices e linhas com "....número"
+4. Remova marcas d'água e avisos de copyright que aparecem no meio do texto
+5. Remova rodapés repetidos (ex: "www.grancursosonline.com.br", "X de Y", "O conteúdo deste livro é licenciado para...")
+6. Mantenha o conteúdo educacional COMPLETO e INTACTO — NÃO resuma, NÃO corte nada
+7. Retorne APENAS o texto limpo, sem comentários ou explicações
+
+TEXTO PARA LIMPAR:
+${textoRaw.slice(0, 15000)}`,
+    }],
+  });
+
+  const content = msg.content[0];
+  if (content.type === "text") return content.text.trim();
+  return textoRaw;
+}
+
+// Wrapper com fallback: se Claude falhar, usa o texto bruto
+async function limparTexto(textoRaw: string): Promise<string> {
+  try {
+    return await limparTextoComClaude(textoRaw);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Fallback silencioso se for erro de crédito ou rate limit
+    if (msg.includes("credit") || msg.includes("429") || msg.includes("400")) {
+      process.stdout.write("~"); // indica fallback
+      return textoRaw.slice(0, 15000); // salva bruto mas indexa mesmo assim
+    }
+    throw err; // outros erros sobem normalmente
+  }
+}
 
 // ────────────────────────────────────────────────────────────
 // TIPOS
@@ -240,61 +288,8 @@ async function indexarPdf(opts: {
       return;
     }
 
-    // ── 1. Limpar texto: corrigir palavras coladas (problema de fonte PDF) ──
-    function fixSpaces(t: string): string {
-      return t
-        // Espaço entre minúscula → maiúscula (ex: "vocêJá" → "você Já")
-        .replace(/([a-záàâãéèêíïóôõúüçñ])([A-ZÁÀÂÃÉÈÊÍÏÓÔÕÚÜÇÑ])/g, "$1 $2")
-        // Espaço após pontuação colada (ex: "texto.Próximo" → "texto. Próximo")
-        .replace(/([.!?;:,])([A-Za-záàâãéèêíïóôõúüçñ])/g, "$1 $2")
-        // Remove espaços duplos
-        .replace(/ {2,}/g, " ")
-        .trim();
-    }
-
-    // ── 2. Remover blocos de capa, copyright e sumário ──
-    const linhas = textoRaw.split("\n");
-    const linhasLimpas: string[] = [];
-    let dentroSumario = false;
-    let charsCapaAcum = 0;
-    let passouCapa = false;
-
-    for (const linhaOriginal of linhas) {
-      const linha = linhaOriginal.trim();
-
-      // Detectar início de sumário / índice
-      if (/^(sum[aá]rio|[íi]ndice|conte[uú]do)\s*$/i.test(linha)) {
-        dentroSumario = true;
-        continue;
-      }
-      // Sair do sumário quando aparecer linha de conteúdo real (sem pontinhos)
-      if (dentroSumario) {
-        if (/\.{3,}/.test(linha) || /^\d+$/.test(linha) || linha.length < 5) continue;
-        dentroSumario = false;
-      }
-
-      // Pular capa/metadados no início (até 2500 chars acumulados)
-      if (!passouCapa && charsCapaAcum < 2500) {
-        const ehMetadado =
-          linha.length < 60 ||
-          /^(presidente|vice|diretor|coordenador|c[oó]digo|o conte[uú]do|www\.|todo o material|ser[aá] proibid|isbn|©|copyright|gran cursos|professor|autora?:|doutor|mestre|especiali|bacharel|pela universidade|lattes\.cnpq)/i.test(linha);
-        if (ehMetadado) {
-          charsCapaAcum += linha.length + 1;
-          continue;
-        }
-        passouCapa = true;
-      }
-
-      // Pular rodapés repetitivos
-      if (/^(www\.|O conte[uú]do deste livro|CÓDIGO:|de \d{1,3} \s*www\.)/i.test(linha)) continue;
-      if (/^\d{1,3}\s+de\s+\d{1,3}/.test(linha)) continue; // "3 de 164"
-
-      linhasLimpas.push(linhaOriginal);
-    }
-
-    // ── 3. Juntar, corrigir espaços e validar ──
-    const textoBase = linhasLimpas.join("\n").trim() || textoRaw;
-    const texto = fixSpaces(textoBase);
+    // Usar Claude Haiku para limpar o texto (com fallback para texto bruto)
+    const texto = await limparTexto(textoRaw);
 
     if (!texto || texto.length < 50) {
       stats.skipped++;
@@ -322,7 +317,7 @@ async function indexarPdf(opts: {
           ${disciplinaId}::text,
           'RESUMO'::"ConteudoTipo",
           ${fileName.replace(/\.pdf$/i, "")},
-          ${texto.slice(0, 6000)},
+          ${texto},
           ${pdfPath},
           ${embedding}::vector,
           NOW()
