@@ -28,18 +28,34 @@ async function limparTextoComClaude(textoRaw: string): Promise<string> {
     max_tokens: 8096,
     messages: [{
       role: "user",
-      content: `Você é um limpador de texto de materiais didáticos brasileiros para concursos públicos.
+      content: `Você é um organizador de material didático para concursos públicos brasileiros.
 
-O texto abaixo foi extraído de um PDF com problemas de codificação. Limpe-o seguindo estas regras:
-1. Junte palavras separadas incorretamente (ex: "Direi To Tribu Tário" → "Direito Tributário", "Pri NCÍPio S" → "Princípios")
-2. Junte palavras coladas sem espaço (ex: "vocêJáouviu" → "você já ouviu")
-3. Remova sumários, índices e linhas com "....número"
-4. Remova marcas d'água e avisos de copyright que aparecem no meio do texto
-5. Remova rodapés repetidos (ex: "www.grancursosonline.com.br", "X de Y", "O conteúdo deste livro é licenciado para...")
-6. Mantenha o conteúdo educacional COMPLETO e INTACTO — NÃO resuma, NÃO corte nada
-7. Retorne APENAS o texto limpo, sem comentários ou explicações
+Analise o texto abaixo extraído de um PDF e retorne APENAS o conteúdo educacional limpo e estruturado.
 
-TEXTO PARA LIMPAR:
+═══ REMOVA COMPLETAMENTE ═══
+- Sumários e índices (linhas com "....", "......1", "......25" etc)
+- Qualquer menção a "Gran Cursos", "grancursosonline.com.br", "www.grancursos"
+- Avisos de copyright, licença, reprodução proibida
+- "O conteúdo deste livro é licenciado para [NOME]"
+- Rodapés: "X de Y", "2 de 77", "www.", números de página isolados
+- Biografia do professor (doutor, mestre, lattes.cnpq, etc)
+- Apresentação/introdução do curso
+- Cabeçalhos repetidos de capítulo
+
+═══ CORRIJA ═══
+- Palavras com letras separadas: "DiReiTO" → "Direito", "Direi To Tribu Tário" → "Direito Tributário"
+- Palavras coladas: "vocêJáouviu" → "você já ouviu", "ocrédito" → "o crédito"
+- Letras maiúsculas intercaladas: "PRiNCÍPiOS" → "Princípios"
+
+═══ MANTENHA ═══
+- TODO conteúdo jurídico, técnico e educacional
+- Artigos de lei, definições, conceitos, exemplos práticos
+- Estrutura de tópicos, listas e subtópicos
+- Tabelas e esquemas
+
+NÃO resuma. NÃO adicione texto. NÃO explique. Retorne APENAS o texto limpo.
+
+TEXTO:
 ${textoRaw.slice(0, 15000)}`,
     }],
   });
